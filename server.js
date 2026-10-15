@@ -15,6 +15,7 @@ const DATA_DIR = path.join(__dirname, 'data');
 const UPLOAD_DIR = path.join(__dirname, 'public', 'uploads');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
+const VIDEOS_FILE = path.join(DATA_DIR, 'videos.json');
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -29,6 +30,7 @@ function writeJson(file, value) {
 }
 let users = readJson(USERS_FILE, []);
 let messages = readJson(MESSAGES_FILE, []);
+let videos = readJson(VIDEOS_FILE, []);
 const socketsByLogin = new Map();
 
 app.use(express.json({ limit: '1mb' }));
@@ -55,24 +57,11 @@ const upload = multer({
   }
 });
 
-
-// Аватарки принимают только изображения размером до 5 МБ.
-const avatarUpload = multer({
-  storage,
-  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
-  fileFilter: (_req, file, cb) => {
-    if (!/^image\/(png|jpeg|gif|webp|avif|bmp|svg\+xml)$/i.test(file.mimetype)) {
-      return cb(new Error('Для аватарки разрешены только изображения'));
-    }
-    cb(null, true);
-  }
-});
-
 function cleanLogin(value) {
   return String(value || '').trim().toLowerCase();
 }
 function publicUser(user) {
-  return { login: user.login, name: user.name, ...(user.avatar ? { avatar: user.avatar } : {}) };
+  return { login: user.login, name: user.name };
 }
 function validLogin(login) {
   return /^[a-z0-9_.-]{3,24}$/.test(login);
@@ -82,6 +71,52 @@ function getConversation(a, b) {
     .sort((x, y) => x.time - y.time);
 }
 function saveMessages() { writeJson(MESSAGES_FILE, messages); }
+function saveVideos() { writeJson(VIDEOS_FILE, videos); }
+function parseVideoUrl(input) {
+  let url;
+  try { url = new URL(String(input || '').trim()); } catch { return null; }
+  if (!['http:', 'https:'].includes(url.protocol)) return null;
+  const host = url.hostname.toLowerCase().replace(/^www\./, '').replace(/^m\./, '');
+  let platform = '', id = '', embedUrl = '', ratio = '16:9';
+  if (host === 'youtube.com' || host === 'youtu.be' || host === 'youtube-nocookie.com') {
+    platform = 'YouTube';
+    if (host === 'youtu.be') id = url.pathname.split('/').filter(Boolean)[0] || '';
+    else id = url.searchParams.get('v') || (url.pathname.match(/\/(?:embed|shorts|live)\/([^/?]+)/) || [])[1] || '';
+    if (!/^[\w-]{6,20}$/.test(id)) return null;
+    embedUrl = `https://www.youtube.com/embed/${id}`;
+  } else if (host === 'tiktok.com' || host.endsWith('.tiktok.com')) {
+    platform = 'TikTok'; ratio = '9:16';
+    id = (url.pathname.match(/\/video\/(\d+)/) || [])[1] || '';
+    if (!id) return null;
+    embedUrl = `https://www.tiktok.com/embed/v2/${id}`;
+  } else if (host === 'instagram.com' || host.endsWith('.instagram.com')) {
+    platform = 'Instagram'; ratio = '9:16';
+    id = (url.pathname.match(/\/(?:p|reel|tv)\/([\w-]+)/) || [])[1] || '';
+    if (!id) return null;
+    embedUrl = `https://www.instagram.com/p/${id}/embed`;
+  } else if (host === 'vk.com' || host === 'vk.ru' || host === 'm.vk.com') {
+    platform = 'VK';
+    const oid = url.searchParams.get('oid') || (url.pathname.match(/video(-?\d+)_/) || [])[1];
+    id = url.searchParams.get('id') || (url.pathname.match(/video-?\d+_(\d+)/) || [])[1] || '';
+    if (oid && id) embedUrl = `https://vk.com/video_ext.php?oid=${encodeURIComponent(oid)}&id=${encodeURIComponent(id)}`;
+    else {
+      const match = url.pathname.match(/video(-?\d+)_(\d+)/);
+      if (!match) return null;
+      embedUrl = `https://vk.com/video_ext.php?oid=${match[1]}&id=${match[2]}`; id = match[2];
+    }
+    ratio = '16:9';
+  } else if (host === 'rutube.ru' || host.endsWith('.rutube.ru')) {
+    platform = 'Rutube'; id = (url.pathname.match(/\/video\/([\w-]+)/) || [])[1] || '';
+    if (!id) return null; embedUrl = `https://rutube.ru/play/embed/${id}`;
+  } else if (host === 'twitter.com' || host === 'x.com' || host.endsWith('.twitter.com')) {
+    platform = 'Twitter'; id = (url.pathname.match(/\/status\/(\d+)/) || [])[1] || '';
+    if (!id) return null; embedUrl = `https://platform.twitter.com/embed/Tweet.html?id=${id}`;
+  } else return null;
+  return { platform, id, originalUrl: url.href, embedUrl, ratio };
+}
+function publicVideo(video, viewer) {
+  return { ...video, liked: video.likes.includes(viewer), saved: video.savedBy.includes(viewer), likes: video.likes.length };
+}
 function emitToLogin(login, event, payload) {
   const ids = socketsByLogin.get(login);
   if (!ids) return;
@@ -128,47 +163,8 @@ app.get('/api/messages/:a/:b', (req, res) => {
   if (!users.some(u => u.login === a) || !users.some(u => u.login === b)) {
     return res.status(404).json({ error: 'Пользователь не найден' });
   }
-  res.json(getConversation(a, b).map(({ id, from, to, text, time, file, edited, read, replyTo, pinned }) =>
-    ({ id, from, to, text, time, file: file || null, edited: !!edited, read: !!read, replyTo: replyTo || null, pinned: !!pinned })));
-});
-
-
-app.get('/api/profile/:login', (req, res) => {
-  const login = cleanLogin(req.params.login);
-  const user = users.find(u => u.login === login);
-  if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
-  res.set('Cache-Control', 'no-store');
-  res.json({ user: publicUser(user) });
-});
-
-app.patch('/api/profile', (req, res) => {
-  try {
-    const login = cleanLogin(req.body.login);
-    const user = users.find(u => u.login === login);
-    if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
-    if (typeof req.body.name === 'string') {
-      const name = req.body.name.trim().slice(0, 40);
-      if (!name) return res.status(400).json({ error: 'Имя не может быть пустым' });
-      user.name = name;
-    }
-    if (typeof req.body.avatar === 'string') {
-      if (!req.body.avatar.startsWith('/uploads/') || req.body.avatar.length > 300) {
-        return res.status(400).json({ error: 'Некорректный путь аватарки' });
-      }
-      user.avatar = req.body.avatar;
-    }
-    writeJson(USERS_FILE, users);
-    res.json({ user: publicUser(user) });
-    io.emit('profile-updated', publicUser(user));
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Не удалось обновить профиль' });
-  }
-});
-
-app.post('/api/upload-avatar', avatarUpload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'Файл не выбран' });
-  res.json({ file: { name: req.file.originalname, url: `/uploads/${req.file.filename}`, size: req.file.size, mime: req.file.mimetype } });
+  res.json(getConversation(a, b).map(({ id, from, to, text, time, file, edited, read }) =>
+    ({ id, from, to, text, time, file: file || null, edited: !!edited, read: !!read })));
 });
 
 app.post('/api/upload', upload.single('file'), (req, res) => {
@@ -184,10 +180,65 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
 });
 app.use((err, _req, res, _next) => {
   if (err instanceof multer.MulterError) {
-    const msg = err.code === 'LIMIT_FILE_SIZE' ? 'Превышен максимальный размер файла (5 МБ для аватарки, 15 МБ для вложений)' : 'Не удалось загрузить файл';
+    const msg = err.code === 'LIMIT_FILE_SIZE' ? 'Максимальный размер файла — 15 МБ' : 'Не удалось загрузить файл';
     return res.status(400).json({ error: msg });
   }
   if (err) return res.status(400).json({ error: err.message || 'Ошибка запроса' });
+});
+
+app.get('/api/videos', (req, res) => {
+  const viewer = cleanLogin(req.query.login);
+  const platform = String(req.query.platform || 'all');
+  const allowed = ['all', 'TikTok', 'YouTube', 'VK'];
+  if (!allowed.includes(platform)) return res.status(400).json({ error: 'Неизвестный фильтр' });
+  res.set('Cache-Control', 'no-store');
+  res.json(videos.filter(v => platform === 'all' || v.platform === platform).sort((a,b) => b.time-a.time).map(v => publicVideo(v, viewer)));
+});
+app.post('/api/videos', (req, res) => {
+  const author = cleanLogin(req.body.login);
+  if (!users.some(u => u.login === author)) return res.status(401).json({ error: 'Сначала войдите в аккаунт' });
+  const parsed = parseVideoUrl(req.body.url);
+  if (!parsed) return res.status(400).json({ error: 'Не удалось распознать ссылку. Поддерживаются TikTok, YouTube, Instagram, VK, Rutube и X/Twitter.' });
+  const video = { id: crypto.randomUUID(), ...parsed, author, time: Date.now(), likes: [], comments: [], savedBy: [] };
+  videos.push(video); saveVideos();
+  const payload = publicVideo(video, author);
+  io.emit('video-added', payload);
+  res.status(201).json(payload);
+});
+app.post('/api/videos/:id/like', (req, res) => {
+  const login = cleanLogin(req.body.login);
+  if (!users.some(u => u.login === login)) return res.status(401).json({ error: 'Сначала войдите в аккаунт' });
+  const video = videos.find(v => v.id === req.params.id);
+  if (!video) return res.status(404).json({ error: 'Видео не найдено' });
+  const idx = video.likes.indexOf(login); if (idx >= 0) video.likes.splice(idx, 1); else video.likes.push(login);
+  saveVideos(); const payload = { id: video.id, likes: video.likes.length, login, liked: video.likes.includes(login) };
+  io.emit('video-liked', payload); res.json(payload);
+});
+app.post('/api/videos/:id/comment', (req, res) => {
+  const login = cleanLogin(req.body.login), text = String(req.body.text || '').trim().slice(0, 1000);
+  if (!users.some(u => u.login === login)) return res.status(401).json({ error: 'Сначала войдите в аккаунт' });
+  if (!text) return res.status(400).json({ error: 'Напиши комментарий' });
+  const video = videos.find(v => v.id === req.params.id); if (!video) return res.status(404).json({ error: 'Видео не найдено' });
+  const comment = { id: crypto.randomUUID(), login, text, time: Date.now() };
+  video.comments.push(comment); saveVideos(); const payload = { id: video.id, comment };
+  io.emit('video-commented', payload); res.status(201).json(payload);
+});
+app.delete('/api/videos/:id', (req, res) => {
+  const login = cleanLogin(req.query.login || req.body.login);
+  const idx = videos.findIndex(v => v.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: 'Видео не найдено' });
+  if (videos[idx].author !== login) return res.status(403).json({ error: 'Удалить может только автор' });
+  videos.splice(idx, 1); saveVideos(); io.emit('video-deleted', { id: req.params.id }); res.json({ ok: true });
+});
+app.get('/api/videos/saved/:login', (req, res) => {
+  const login = cleanLogin(req.params.login);
+  if (!users.some(u => u.login === login)) return res.status(401).json({ error: 'Пользователь не найден' });
+  res.json(videos.filter(v => v.savedBy.includes(login)).sort((a,b)=>b.time-a.time).map(v=>publicVideo(v, login)));
+});
+app.post('/api/videos/:id/save', (req, res) => {
+  const login = cleanLogin(req.body.login); if (!users.some(u=>u.login===login)) return res.status(401).json({error:'Сначала войдите в аккаунт'});
+  const video = videos.find(v=>v.id===req.params.id); if (!video) return res.status(404).json({error:'Видео не найдено'});
+  const idx=video.savedBy.indexOf(login); if(idx>=0)video.savedBy.splice(idx,1);else video.savedBy.push(login); saveVideos(); res.json({saved:video.savedBy.includes(login)});
 });
 
 io.on('connection', socket => {
@@ -206,25 +257,6 @@ io.on('connection', socket => {
     io.emit('online', onlineList());
   });
 
-  // Сигналинг WebRTC: SDP и ICE передаются только между двумя авторизованными сокетами.
-  function validPeer(to) { return typeof to === 'string' && users.some(u => u.login === cleanLogin(to)) && cleanLogin(to) !== loginForSocket; }
-  socket.on('call-offer', payload => {
-    if (!loginForSocket || !payload || !validPeer(payload.to) || !payload.offer || typeof payload.offer.sdp !== 'string') return;
-    emitToLogin(cleanLogin(payload.to), 'call-offer', { from: loginForSocket, offer: payload.offer });
-  });
-  socket.on('call-answer', payload => {
-    if (!loginForSocket || !payload || !validPeer(payload.to) || !payload.answer || typeof payload.answer.sdp !== 'string') return;
-    emitToLogin(cleanLogin(payload.to), 'call-answer', { from: loginForSocket, answer: payload.answer });
-  });
-  socket.on('call-ice', payload => {
-    if (!loginForSocket || !payload || !validPeer(payload.to) || !payload.candidate || typeof payload.candidate.candidate !== 'string') return;
-    emitToLogin(cleanLogin(payload.to), 'call-ice', { from: loginForSocket, candidate: payload.candidate });
-  });
-  socket.on('call-end', payload => {
-    if (!loginForSocket || !payload || !validPeer(payload.to)) return;
-    emitToLogin(cleanLogin(payload.to), 'call-end', { from: loginForSocket, reason: String(payload.reason || '').slice(0, 30) });
-  });
-
   socket.on('message', payload => {
     if (!loginForSocket || !payload || typeof payload !== 'object') return;
     const to = cleanLogin(payload.to);
@@ -239,13 +271,7 @@ io.on('connection', socket => {
     if (!text && !(file && file.url)) return;
     const msg = {
       id: crypto.randomUUID(), from: loginForSocket, to, text,
-      time: Date.now(), file, edited: false, read: false,
-      replyTo: payload.replyTo && typeof payload.replyTo === 'object' ? {
-        id: String(payload.replyTo.id || '').slice(0, 80),
-        from: cleanLogin(payload.replyTo.from),
-        text: String(payload.replyTo.text || '').slice(0, 240)
-      } : null,
-      pinned: false
+      time: Date.now(), file, edited: false, read: false
     };
     messages.push(msg);
     saveMessages();
@@ -274,25 +300,6 @@ io.on('connection', socket => {
     saveMessages();
     emitToLogin(msg.from, 'message-deleted', { id: msg.id });
     emitToLogin(msg.to, 'message-deleted', { id: msg.id });
-  });
-
-  // Закреплено может быть только одно сообщение в личном диалоге.
-  socket.on('pin-message', payload => {
-    if (!loginForSocket || !payload || typeof payload.id !== 'string') return;
-    const target = messages.find(m => m.id === payload.id &&
-      ((m.from === loginForSocket && m.to === cleanLogin(payload.peer)) ||
-       (m.to === loginForSocket && m.from === cleanLogin(payload.peer))));
-    if (!target) return;
-    const peer = cleanLogin(payload.peer);
-    for (const m of messages) {
-      if ((m.from === loginForSocket && m.to === peer) || (m.from === peer && m.to === loginForSocket)) {
-        m.pinned = m.id === target.id;
-      }
-    }
-    saveMessages();
-    const conversation = getConversation(loginForSocket, peer).map(m => ({ ...m }));
-    emitToLogin(loginForSocket, 'pin-updated', { peer, messages: conversation });
-    emitToLogin(peer, 'pin-updated', { peer: loginForSocket, messages: conversation });
   });
 
   socket.on('typing', payload => {
